@@ -61,7 +61,7 @@ still loses more games — holding blanks is costly.
 
 ---
 
-## v6-fast-sim (current)
+## v6-fast-sim
 **Tag:** `v6-fast-sim`
 **Strategy:** Monte Carlo simulation with Quackle-calibrated leave values.
 - Quackle single-tile leave values (O'Laughlin calibration): ?=25.57, S=8.04, Z=5.12, X=3.31, vowels negative (U=-5.10, O=-2.50, I=-2.07, A=-0.63)
@@ -86,3 +86,30 @@ upgrade over naive heuristics. Minimizing opponent variance (MinVariance) adds
 no value at N_SAMPLES=5 — too noisy. Endgame minimax backfired due to
 over-aggressive pre-endgame defense. Pure calibrated leave (QuackleLeave) is
 the best fast option at 55% with normal speed.
+
+---
+
+## v7-crossplay-tuned
+**Tag:** `v7-crossplay-tuned`
+**Strategy:** Crossplay-calibrated leave values + endgame decay. Adjusts Quackle
+Scrabble values for Crossplay rules (sweep=40pts, different tile face values,
+no end-of-game tile penalty). Simulation structure unchanged (5×5).
+**Results:** vs DefensiveBot: **~60%** (partial, 47-32 at stop); vs v6: **24-15** head-to-head
+
+---
+
+## v8-cython (current)
+**Tag:** `v8-cython`
+**Strategy:** v7 Crossplay-calibrated leave values + Cython-accelerated move finder
++ full move list search + N_SAMPLES=50.
+- Pulled `gaddag_accel.cp312-win_amd64.pyd` from bheil123/crossplay-tournament
+- 15-20x speedup: ~0.5 games/s vs 0.03 games/s pure Python
+- Search all legal moves (not just top 20) before selecting top 5 candidates
+- N_SAMPLES=50 (was 5) for much more reliable simulation
+**Results:**
+- vs DefensiveBot: **70-29-1**, avg spread **+40.6** (2365s/100 games)
+- vs DadBot (8-worker parallel, 300 samples, SuperLeaves): **56-44**, avg spread **+8.2**
+
+**Takeaway:** Crossplay-calibrated leave values beat DadBot's Scrabble-calibrated
+SuperLeaves despite DadBot having 6x more samples and 8x parallelism. Correct
+calibration for the actual game rules > raw compute.
