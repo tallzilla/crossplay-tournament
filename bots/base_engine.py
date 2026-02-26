@@ -129,8 +129,8 @@ def get_legal_moves(board, rack, blanks_on_board=None):
 
     gaddag = _get_gaddag()
 
-    from engine.move_finder import find_all_moves_opt
-    moves = find_all_moves_opt(board, gaddag, rack, board_blanks=blanks_on_board)
+    from engine.move_finder import find_all_moves_c
+    moves = find_all_moves_c(board, gaddag, rack, board_blanks=blanks_on_board)
 
     # Enrich each move with tiles_used and leave
     for m in moves:

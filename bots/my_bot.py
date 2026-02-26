@@ -18,7 +18,7 @@ from bots.base_engine import BaseEngine, get_legal_moves
 from engine.config import TILE_DISTRIBUTION
 
 N_CANDIDATES = 5
-N_SAMPLES    = 5
+N_SAMPLES    = 50
 
 # Crossplay-calibrated single-tile leave values
 CROSSPLAY_TILE_VALUES = {
@@ -136,7 +136,7 @@ class MyBot(BaseEngine):
         unseen = unseen_tiles(board, rack, game_info)
 
         candidates = sorted(
-            moves[:20],
+            moves,
             key=lambda m: m['score'] + crossplay_leave_value(
                 m.get('leave', ''), tiles_in_bag, unseen),
             reverse=True

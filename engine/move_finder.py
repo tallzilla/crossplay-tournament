@@ -15,6 +15,8 @@ All coordinates internal to this module are 0-indexed.
 Output moves use 1-indexed coordinates (matching the rest of the codebase).
 """
 
+import os
+import sys
 import struct
 from collections import Counter
 from typing import List, Dict, Optional, Set, Tuple
@@ -23,6 +25,30 @@ from engine.config import (
     BOARD_SIZE, CENTER_ROW, CENTER_COL, VALID_TWO_LETTER,
     TILE_VALUES, BONUS_SQUARES, BINGO_BONUS, RACK_SIZE,
 )
+
+# ---------------------------------------------------------------------------
+# Optional Cython acceleration (gaddag_accel.pyd / .so)
+# Falls back to pure Python if not available -- zero behavior change.
+# ---------------------------------------------------------------------------
+_accel = None
+_accel_dir = os.path.dirname(os.path.abspath(__file__))
+if _accel_dir not in sys.path:
+    sys.path.insert(0, _accel_dir)
+try:
+    import gaddag_accel as _accel
+except ImportError:
+    pass
+
+# Cache bytes(gaddag._data) to avoid 28MB copy per call
+_gdata_bytes_cache = None
+_gdata_source_id = None
+
+def _get_gdata_bytes(gdata):
+    global _gdata_bytes_cache, _gdata_source_id
+    if _gdata_source_id != id(gdata):
+        _gdata_bytes_cache = bytes(gdata)
+        _gdata_source_id = id(gdata)
+    return _gdata_bytes_cache
 
 # === Pre-computed lookup tables (module-level, built once) ===
 
@@ -62,6 +88,119 @@ def _get_dict():
         from engine.dictionary import get_dictionary
         _dictionary = get_dictionary()
     return _dictionary
+
+
+def is_c_available():
+    """Check if C-accelerated move finder is available."""
+    return _accel is not None
+
+
+def find_all_moves_c(board, gaddag, rack_str: str,
+                     board_blanks: List[Tuple[int, int, str]] = None) -> List[Dict]:
+    """
+    Find all valid moves using C-accelerated GADDAG traversal + scoring.
+    Falls back to find_all_moves_opt() if Cython extension not available.
+
+    Same interface and output format as find_all_moves_opt().
+    """
+    if _accel is None:
+        return find_all_moves_opt(board, gaddag, rack_str, board_blanks=board_blanks)
+
+    rack_str = rack_str.upper()
+    grid = board._grid
+    dictionary = _get_dict()
+    board_blank_set = {(r - 1, c - 1) for r, c, _ in (board_blanks or [])}
+
+    gdata_bytes = _get_gdata_bytes(gaddag._data)
+
+    # C traversal: returns list of (word, row_1idx, col_1idx, is_horiz, blanks_list)
+    raw_moves = _accel.find_moves_c(
+        gdata_bytes, grid, rack_str,
+        dictionary._words, VALID_TWO_LETTER,
+    )
+
+    # C scoring: returns move dicts with word, row, col, direction, score, etc.
+    moves = _accel.score_moves_c(
+        raw_moves, grid, board_blank_set,
+        _TV, _BONUS, BINGO_BONUS, RACK_SIZE,
+    )
+
+    # Post-validation: reject moves with invalid main/cross words
+    validated = []
+    for m in moves:
+        ok = True
+        word_str = m['word']
+        r1, c1 = m['row'], m['col']
+        r0, c0 = r1 - 1, c1 - 1
+        is_h = m['direction'] == 'H'
+        wlen = len(word_str)
+
+        # Build full main-axis word (may extend beyond placed word)
+        if is_h:
+            full_start = c0
+            fc = c0 - 1
+            while fc >= 0 and grid[r0][fc] is not None:
+                full_start = fc
+                fc -= 1
+            full_end = c0 + wlen - 1
+            fc = c0 + wlen
+            while fc < 15 and grid[r0][fc] is not None:
+                full_end = fc
+                fc += 1
+            full_chars = []
+            for fc in range(full_start, full_end + 1):
+                if c0 <= fc < c0 + wlen:
+                    full_chars.append(word_str[fc - c0])
+                elif grid[r0][fc] is not None:
+                    full_chars.append(grid[r0][fc])
+                else:
+                    ok = False
+                    break
+        else:
+            full_start = r0
+            fr = r0 - 1
+            while fr >= 0 and grid[fr][c0] is not None:
+                full_start = fr
+                fr -= 1
+            full_end = r0 + wlen - 1
+            fr = r0 + wlen
+            while fr < 15 and grid[fr][c0] is not None:
+                full_end = fr
+                fr += 1
+            full_chars = []
+            for fr in range(full_start, full_end + 1):
+                if r0 <= fr < r0 + wlen:
+                    full_chars.append(word_str[fr - r0])
+                elif grid[fr][c0] is not None:
+                    full_chars.append(grid[fr][c0])
+                else:
+                    ok = False
+                    break
+
+        if ok:
+            full_word = ''.join(full_chars)
+            if len(full_word) >= 2:
+                if len(full_word) == 2:
+                    ok = full_word in VALID_TWO_LETTER
+                else:
+                    ok = dictionary.is_valid(full_word)
+
+        # Validate cross-words
+        if ok:
+            for cw in m.get('crosswords', []):
+                cw_word = cw['word']
+                if len(cw_word) == 2:
+                    if cw_word not in VALID_TWO_LETTER:
+                        ok = False
+                        break
+                elif not dictionary.is_valid(cw_word):
+                    ok = False
+                    break
+
+        if ok:
+            validated.append(m)
+
+    return validated
 
 
 def find_all_moves_opt(board, gaddag, rack_str: str,
