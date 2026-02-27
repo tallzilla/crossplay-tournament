@@ -79,6 +79,33 @@ DOUBLE_WORD_SQUARES: List[Tuple[int, int]] = [
 # VALID 2-LETTER WORDS
 # =============================================================================
 
+# =============================================================================
+# THREAT ANALYZER CONSTANTS (used by real_risk.py)
+# =============================================================================
+
+# Pattern match limits (tiered by bonus count and wildcard density)
+THREAT_LIMIT_NO_BONUS = 100
+THREAT_LIMIT_NO_BONUS_WILD = 500
+THREAT_LIMIT_SINGLE_BONUS = 500
+THREAT_LIMIT_SINGLE_BONUS_WILD = 2000
+THREAT_LIMIT_MULTI_BONUS = 2000
+THREAT_LIMIT_MULTI_BONUS_WILD = 5000
+THREAT_WILDCARD_THRESHOLD = 4       # wildcards >= this -> use "wild" limits
+
+# Threat filtering
+THREAT_MIN_SCORE = 6                # ignore threats scoring below this
+THREAT_MIN_PROB = 0.001             # ignore threats with P < 0.1%
+
+# Result collection
+THREAT_TOP_BY_EV = 20               # top threats by expected value (board-wide)
+THREAT_TOP_BY_SCORE = 5             # extra top threats by raw score (board-wide)
+THREAT_PER_MOVE_TOP_EV = 6          # top threats by EV (per-move)
+THREAT_PER_MOVE_TOP_SCORE = 3       # extra top threats by score (per-move)
+
+# =============================================================================
+# VALID 2-LETTER WORDS
+# =============================================================================
+
 VALID_TWO_LETTER: set = {
     'AA', 'AB', 'AD', 'AE', 'AG', 'AH', 'AI', 'AL', 'AM', 'AN', 'AR', 'AS', 'AT', 'AW', 'AX', 'AY',
     'BA', 'BE', 'BI', 'BO', 'BY',

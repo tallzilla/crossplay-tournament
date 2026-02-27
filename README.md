@@ -60,10 +60,43 @@ python play_match.py BOT1 BOT2              # 10 games, show summary
 python play_match.py BOT1 BOT2 --games 100  # 100 games
 python play_match.py BOT1 BOT2 --watch      # watch 1 game visually
 python play_match.py --tournament --games 50 # round-robin all bots
+python play_match.py BOT1 BOT2 --tier fast  # set speed tier (see below)
 ```
 
 Bot names are the Python file names in `bots/` or `examples/`
 (without the `.py`).
+
+## Speed tiers
+
+The `--tier` flag controls how much time bots are allowed to think.
+Any bot can read `os.environ['BOT_TIER']` and adjust its strategy.
+
+| Tier | Avg move time | Avg game | Use case |
+|------|--------------|----------|----------|
+| `blitz` | ~1s | ~26s | Quick testing, 100+ game runs |
+| `fast` | ~3s | ~78s | Default tournament play |
+| `standard` | ~10s | ~4 min | Full-strength evaluation |
+| `deep` | ~30s | ~13 min | Maximum strength, analysis |
+
+```bash
+# Quick 100-game test at blitz speed
+python play_match.py my_bot random_bot --games 100 --tier blitz
+
+# Tournament finals at full strength
+python play_match.py --tournament --games 20 --tier standard
+```
+
+**For bot authors:** Reading the tier is optional. If your bot ignores
+it, it runs the same at all tiers. To make your bot tier-aware:
+
+```python
+import os
+tier = os.environ.get('BOT_TIER', 'fast')
+if tier == 'blitz':
+    # Use fewer simulations, faster heuristics
+elif tier == 'deep':
+    # Use more simulations, deeper analysis
+```
 
 ## Project structure
 

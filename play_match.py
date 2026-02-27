@@ -7,6 +7,8 @@ Usage:
     python play_match.py random_bot my_bot --games 100  # 100 games
     python play_match.py random_bot my_bot --watch      # 1 game, show board each turn
     python play_match.py --tournament --games 50         # round-robin all bots/
+    python play_match.py dadbot my_bot --seed 12345     # reproducible games
+    python play_match.py dadbot my_bot --watch --seed 42 # replay a specific game
 
 First run builds the GADDAG (~48 seconds). After that it loads in under 1 second.
 """
@@ -51,17 +53,21 @@ def draw_tiles(bag, rack, count):
     return drawn
 
 
-def play_game(engine1, engine2, watch=False):
+def play_game(engine1, engine2, watch=False, seed=None):
     """Play a single game between two engines.
 
     Args:
         engine1: BaseEngine instance (goes first)
         engine2: BaseEngine instance
         watch: if True, print board after each move
+        seed: if provided, seed the RNG for reproducible tile draws
 
     Returns:
-        dict with game results
+        dict with game results (includes 'seed' for replay)
     """
+    if seed is not None:
+        random.seed(seed)
+
     board = Board()
     bag = make_bag()
     blanks_on_board = []
@@ -79,6 +85,8 @@ def play_game(engine1, engine2, watch=False):
     engines = [engine1, engine2]
     racks = [rack1, rack2]
     scores = [0, 0]
+    # Per-engine timing stats
+    move_times = [[], []]  # list of pick_move durations per engine
 
     if watch:
         print(f"\n{'='*60}")
@@ -96,7 +104,7 @@ def play_game(engine1, engine2, watch=False):
             if final_turns_left is not None:
                 if final_turns_left <= 0:
                     # Game over
-                    return _game_result(engines, scores, watch)
+                    return _game_result(engines, scores, move_times, watch, seed)
                 final_turns_left -= 1
 
             # Build game_info
@@ -111,8 +119,10 @@ def play_game(engine1, engine2, watch=False):
             # Generate legal moves
             moves = get_legal_moves(board, rack, blanks_on_board)
 
-            # Ask engine to pick a move
+            # Ask engine to pick a move (timed)
+            t_pick = time.time()
             chosen = engine.pick_move(board, rack, moves, game_info)
+            move_times[player_idx].append(time.time() - t_pick)
 
             if chosen is None or not moves:
                 # Pass
@@ -131,7 +141,7 @@ def play_game(engine1, engine2, watch=False):
                 })
 
                 if consecutive_passes >= 4:
-                    return _game_result(engines, scores, watch)
+                    return _game_result(engines, scores, move_times, watch, seed)
                 continue
 
             consecutive_passes = 0
@@ -190,10 +200,10 @@ def play_game(engine1, engine2, watch=False):
                 'blanks_on_board': list(blanks_on_board),
             })
 
-    return _game_result(engines, scores, watch)
+    return _game_result(engines, scores, move_times, watch, seed)
 
 
-def _game_result(engines, scores, watch):
+def _game_result(engines, scores, move_times, watch, seed=None):
     """Build and optionally display game result."""
     if scores[0] > scores[1]:
         result = 'win'
@@ -228,6 +238,9 @@ def _game_result(engines, scores, watch):
         'score2': scores[1],
         'spread': scores[0] - scores[1],
         'winner': engines[0].name if scores[0] > scores[1] else (engines[1].name if scores[1] > scores[0] else 'tie'),
+        'move_times_1': move_times[0],
+        'move_times_2': move_times[1],
+        'seed': seed,
     }
 
 
@@ -274,15 +287,35 @@ def find_all_bots():
 # Match modes
 # =========================================================================
 
-def run_match(engine1, engine2, num_games, watch=False):
-    """Run a match (series of games) between two engines."""
+def run_match(engine1, engine2, num_games, watch=False, master_seed=None,
+              game_seeds=None):
+    """Run a match (series of games) between two engines.
+
+    game_seeds: optional list of pre-assigned per-game seeds (one per game).
+                When provided, overrides master_seed for seed generation.
+    """
+    if game_seeds is not None:
+        # Pre-assigned seeds from tournament runner -- use directly
+        assert len(game_seeds) == num_games, (
+            f"Expected {num_games} seeds, got {len(game_seeds)}")
+    else:
+        # Generate per-game seeds from master seed (or random if none)
+        if master_seed is not None:
+            rng = random.Random(master_seed)
+        else:
+            rng = random.Random()
+        game_seeds = [rng.randint(0, 2**31) for _ in range(num_games)]
+
     if watch:
         # Single game in watch mode
         print(f"\nBuilding GADDAG (first run takes ~48s, then cached)...")
-        result = play_game(engine1, engine2, watch=True)
+        print(f"  Game seed: {game_seeds[0]}")
+        result = play_game(engine1, engine2, watch=True, seed=game_seeds[0])
         return
 
     print(f"\n{engine1.name} vs {engine2.name} ({num_games} games)")
+    if master_seed is not None:
+        print(f"Master seed: {master_seed}")
     print(f"Building GADDAG (first run takes ~48s, then cached)...")
 
     wins1 = 0
@@ -291,17 +324,37 @@ def run_match(engine1, engine2, num_games, watch=False):
     total_spread = 0
     total_score1 = 0
     total_score2 = 0
+    # Per-engine timing aggregation (keyed by engine name)
+    all_move_times = {engine1.name: [], engine2.name: []}
     t_start = time.time()
 
     for i in range(num_games):
+        game_seed = game_seeds[i]
         # Alternate who goes first
+        try:
+            if i % 2 == 0:
+                result = play_game(engine1, engine2, seed=game_seed)
+            else:
+                result = play_game(engine2, engine1, seed=game_seed)
+                # Flip scores for consistent tracking
+                result['score1'], result['score2'] = result['score2'], result['score1']
+                result['spread'] = -result['spread']
+        except Exception as e:
+            first = engine1.name if i % 2 == 0 else engine2.name
+            second = engine2.name if i % 2 == 0 else engine1.name
+            print(f"\n  [CRASH] Game {i+1} (seed={game_seed}, "
+                  f"{first} vs {second}): {type(e).__name__}: {e}")
+            print(f"  Replay: python play_match.py {first.lower()} "
+                  f"{second.lower()} --watch --seed {game_seed}")
+            continue
+
+        # Aggregate move times (engine order alternates each game)
         if i % 2 == 0:
-            result = play_game(engine1, engine2)
+            all_move_times[engine1.name].extend(result.get('move_times_1', []))
+            all_move_times[engine2.name].extend(result.get('move_times_2', []))
         else:
-            result = play_game(engine2, engine1)
-            # Flip scores for consistent tracking
-            result['score1'], result['score2'] = result['score2'], result['score1']
-            result['spread'] = -result['spread']
+            all_move_times[engine2.name].extend(result.get('move_times_1', []))
+            all_move_times[engine1.name].extend(result.get('move_times_2', []))
 
         total_score1 += result['score1']
         total_score2 += result['score2']
@@ -330,10 +383,36 @@ def run_match(engine1, engine2, num_games, watch=False):
     print(f"  {engine1.name} avg: {total_score1 / num_games:>6.1f}  |  {engine2.name} avg: {total_score2 / num_games:>6.1f}")
     elapsed = time.time() - t_start
     print(f"  Time: {elapsed:.1f}s ({num_games / elapsed:.1f} games/s)")
-    print(f"{'='*60}\n")
+    print(f"{'='*60}")
+
+    # Speed report
+    tier = os.environ.get('BOT_TIER', None)
+    tier_targets = {'blitz': 1.0, 'fast': 3.0, 'standard': 10.0, 'deep': 30.0}
+    target = tier_targets.get(tier) if tier else None
+
+    print(f"\n  Speed Report{f' (tier: {tier})' if tier else ''}:")
+    for name in [engine1.name, engine2.name]:
+        times = all_move_times.get(name, [])
+        if not times:
+            print(f"    {name}: no moves recorded")
+            continue
+        avg_t = sum(times) / len(times)
+        max_t = max(times)
+        p95_idx = int(len(times) * 0.95)
+        sorted_t = sorted(times)
+        p95_t = sorted_t[min(p95_idx, len(sorted_t) - 1)]
+        status = ""
+        if target:
+            if avg_t <= target * 1.2:
+                status = " [OK]"
+            else:
+                status = f" [OVER -- target ~{target:.0f}s]"
+        print(f"    {name}: avg {avg_t:.2f}s, p95 {p95_t:.2f}s, max {max_t:.2f}s"
+              f" ({len(times)} moves){status}")
+    print()
 
 
-def run_tournament(num_games):
+def run_tournament(num_games, master_seed=None):
     """Round-robin tournament among all bots in bots/."""
     bot_names = find_all_bots()
     if len(bot_names) < 2:
@@ -341,24 +420,39 @@ def run_tournament(num_games):
         return
 
     print(f"\nTournament: {', '.join(bot_names)} ({num_games} games per matchup)")
+    if master_seed is not None:
+        print(f"Master seed: {master_seed}")
     print(f"Building GADDAG (first run takes ~48s, then cached)...\n")
 
+    # Generate seeds for all matchup games
+    if master_seed is not None:
+        rng = random.Random(master_seed)
+    else:
+        rng = random.Random()
+
     results = {}
+    all_move_times = {}  # per-bot timing aggregation
     for name in bot_names:
         results[name] = {'wins': 0, 'losses': 0, 'ties': 0, 'spread': 0, 'games': 0}
+        all_move_times[name] = []
 
     for i in range(len(bot_names)):
         for j in range(i + 1, len(bot_names)):
             e1 = load_engine(bot_names[i])
             e2 = load_engine(bot_names[j])
             print(f"  {e1.name} vs {e2.name}...", end=' ', flush=True)
+            matchup_seeds = [rng.randint(0, 2**31) for _ in range(num_games)]
 
             w1 = w2 = t = sp = 0
             for g in range(num_games):
                 if g % 2 == 0:
-                    r = play_game(e1, e2)
+                    r = play_game(e1, e2, seed=matchup_seeds[g])
+                    all_move_times[e1.name].extend(r.get('move_times_1', []))
+                    all_move_times[e2.name].extend(r.get('move_times_2', []))
                 else:
-                    r = play_game(e2, e1)
+                    r = play_game(e2, e1, seed=matchup_seeds[g])
+                    all_move_times[e2.name].extend(r.get('move_times_1', []))
+                    all_move_times[e1.name].extend(r.get('move_times_2', []))
                     r['score1'], r['score2'] = r['score2'], r['score1']
                     r['spread'] = -r['spread']
 
@@ -394,7 +488,33 @@ def run_tournament(num_games):
     for name, stats in standings:
         avg_sp = stats['spread'] / max(1, stats['games'])
         print(f"  {name:<20} {stats['wins']:>4} {stats['losses']:>4} {stats['ties']:>4} {avg_sp:>+7.1f}")
-    print(f"{'='*60}\n")
+    print(f"{'='*60}")
+
+    # Speed report
+    tier = os.environ.get('BOT_TIER', None)
+    tier_targets = {'blitz': 1.0, 'fast': 3.0, 'standard': 10.0, 'deep': 30.0}
+    target = tier_targets.get(tier) if tier else None
+
+    print(f"\n  Speed Report{f' (tier: {tier})' if tier else ''}:")
+    for name in bot_names:
+        times = all_move_times.get(name, [])
+        if not times:
+            print(f"    {name}: no moves recorded")
+            continue
+        avg_t = sum(times) / len(times)
+        max_t = max(times)
+        p95_idx = int(len(times) * 0.95)
+        sorted_t = sorted(times)
+        p95_t = sorted_t[min(p95_idx, len(sorted_t) - 1)]
+        status = ""
+        if target:
+            if avg_t <= target * 1.2:
+                status = " [OK]"
+            else:
+                status = f" [OVER -- target ~{target:.0f}s]"
+        print(f"    {name}: avg {avg_t:.2f}s, p95 {p95_t:.2f}s, max {max_t:.2f}s"
+              f" ({len(times)} moves){status}")
+    print()
 
 
 # =========================================================================
@@ -408,15 +528,31 @@ def main():
     parser.add_argument('--games', type=int, default=10, help='Number of games (default: 10)')
     parser.add_argument('--watch', action='store_true', help='Watch a single game with board display')
     parser.add_argument('--tournament', action='store_true', help='Round-robin all bots in bots/')
+    parser.add_argument('--tier', choices=['blitz', 'fast', 'standard', 'deep'],
+                        default=None, help='Speed tier (sets BOT_TIER env var)')
+    parser.add_argument('--seed', type=int, default=None,
+                        help='Master seed for reproducible games (per-game seeds derived from this)')
+    parser.add_argument('--game-seeds', type=str, default=None,
+                        help='Comma-separated per-game seeds (overrides --seed)')
 
     args = parser.parse_args()
 
+    # Set BOT_TIER env var before loading engines
+    if args.tier:
+        os.environ['BOT_TIER'] = args.tier
+
+    # Parse pre-assigned per-game seeds (from run_tourney.py)
+    game_seeds_list = None
+    if args.game_seeds:
+        game_seeds_list = [int(s) for s in args.game_seeds.split(',')]
+
     if args.tournament:
-        run_tournament(args.games)
+        run_tournament(args.games, master_seed=args.seed)
     elif args.engine1 and args.engine2:
         e1 = load_engine(args.engine1)
         e2 = load_engine(args.engine2)
-        run_match(e1, e2, args.games, watch=args.watch)
+        run_match(e1, e2, args.games, watch=args.watch,
+                  master_seed=args.seed, game_seeds=game_seeds_list)
     else:
         parser.print_help()
         print("\nExamples:")

@@ -1,26 +1,35 @@
 """
 MyBot -- Crossplay-calibrated Monte Carlo simulation.
 
-Adjusts Quackle's Scrabble leave values for Crossplay-specific rules:
-  1. Sweep = 40 pts (not 50): blank 25.57→20.0, S 8.04→7.0
-  2. Different tile face values: L=2, U=2, J=10, G=4, K=6, B=4 → less negative
-     V=6, W=5 → more negative (hard to play, high wasted potential)
-  3. No end-of-game tile penalty: leave values decay toward zero as bag empties
-  4. 3 blanks (not 2): captured in sweep-bonus scaling
-
-Simulation: top 5 candidates × 5 opponent samples (Maven/Quackle-inspired).
-
-Results (partial, ~80 games): 47-32 vs DefensiveBot (+16 spread);
-24-15 vs BotFastSim (previous champion, +28 spread).
+v9: Tier-aware parameters (BOT_TIER env var).
+    Hand-tuned single-tile leave values + score+leave opponent model.
+    Vowel/consonant balance heuristic for multi-tile leaves.
+    Leave decay as bag empties. Q-without-U penalty.
 """
+import os
 import random
 from bots.base_engine import BaseEngine, get_legal_moves
 from engine.config import TILE_DISTRIBUTION
 
-N_CANDIDATES = 5
-N_SAMPLES    = 50
+# Tier-aware parameters (~10ms per get_legal_moves call)
+_tier = os.environ.get('BOT_TIER', 'fast')
+if _tier == 'blitz':
+    N_CANDIDATES = 5
+    N_SAMPLES    = 8    # target ~0.5s/move
+elif _tier == 'standard':
+    N_CANDIDATES = 10
+    N_SAMPLES    = 75   # target ~7.5s/move
+elif _tier == 'deep':
+    N_CANDIDATES = 12
+    N_SAMPLES    = 150  # target ~18s/move
+else:  # fast (default)
+    N_CANDIDATES = 8
+    N_SAMPLES    = 50   # target ~2.5s/move
 
-# Crossplay-calibrated single-tile leave values
+
+# ---------------------------------------------------------------------------
+# Crossplay-calibrated single-tile leave values (fallback)
+# ---------------------------------------------------------------------------
 CROSSPLAY_TILE_VALUES = {
     '?': 20.0,   # Blank: 25.57 * (40/50 sweep scale) + 3-blank adjustment
     'S':  7.0,   # S: lower for 40-pt sweep setup (was 8.04)
@@ -34,20 +43,20 @@ CROSSPLAY_TILE_VALUES = {
     'E':  0.35,  # E=1 in both → unchanged
     'N':  0.22,  # N=1 in both → unchanged
     'T': -0.10,  # T=1 in both → unchanged
-    'L':  0.20,  # L=2 in Crossplay (vs 1) → improved (worth more when played)
+    'L':  0.20,  # L=2 in Crossplay (vs 1) → improved
     'P': -0.46,  # P=3 in both → unchanged
     'K': -0.20,  # K=6 in Crossplay (vs 5) → less negative
     'Y': -0.63,  # Y=4 in both → unchanged
     'A': -0.63,  # A=1 in both → unchanged
-    'J': -0.80,  # J=10 in Crossplay (vs 8) → less negative (worth 2 pts more)
+    'J': -0.80,  # J=10 in Crossplay (vs 8) → less negative
     'B': -1.50,  # B=4 in Crossplay (vs 3) → less negative
     'I': -2.07,  # I=1 in both → unchanged
     'F': -2.21,  # F=4 in both → unchanged
     'O': -2.50,  # O=1 in both → unchanged
-    'G': -1.80,  # G=4 in Crossplay (vs 2) → significantly less negative
-    'W': -4.50,  # W=5 in Crossplay (vs 4) → harder to play + higher wasted value
-    'U': -4.00,  # U=2 in Crossplay (vs 1) → less negative (worth more when played)
-    'V': -6.50,  # V=6 in Crossplay (vs 4) → harder to play + high wasted potential
+    'G': -1.80,  # G=4 in Crossplay (vs 2) → less negative
+    'W': -4.50,  # W=5 in Crossplay (vs 4) → harder to play
+    'U': -4.00,  # U=2 in Crossplay (vs 1) → less negative
+    'V': -6.50,  # V=6 in Crossplay (vs 4) → hard to play
     'Q': -6.79,  # Q=10 in both → unchanged
 }
 
@@ -66,14 +75,17 @@ def _leave_decay(tiles_in_bag):
 
 
 def crossplay_leave_value(leave, tiles_in_bag=100, unseen=None):
+    """Return equity of holding this leave."""
     value = sum(CROSSPLAY_TILE_VALUES.get(t, -1.0) for t in leave)
-    vowels = sum(1 for t in leave if t in 'AEIOU')
-    consonants = sum(1 for t in leave if t.isalpha() and t not in 'AEIOU' and t != '?')
+
     if len(leave) >= 2:
+        vowels = sum(1 for t in leave if t in 'AEIOU')
+        consonants = sum(1 for t in leave if t.isalpha() and t not in 'AEIOU' and t != '?')
         if vowels == 1 and consonants >= 1:
             value += 2.0
         elif vowels >= 2 and consonants == 0:
             value -= 5.0
+
     if 'Q' in leave and unseen is not None and unseen.get('U', 0) == 0:
         value -= 8.0
     value *= _leave_decay(tiles_in_bag)
@@ -81,6 +93,7 @@ def crossplay_leave_value(leave, tiles_in_bag=100, unseen=None):
 
 
 def unseen_tiles(board, rack, game_info):
+    """Return dict of {tile: count} for tiles not on board and not in our rack."""
     remaining = dict(TILE_DISTRIBUTION)
     blanks_on_board = {(r, c) for r, c, _ in game_info.get('blanks_on_board', [])}
     for row in range(1, 16):
@@ -96,43 +109,47 @@ def unseen_tiles(board, rack, game_info):
 
 
 def _simulate(board, move, unseen_list, game_info):
-    tiles_in_bag = game_info.get('tiles_in_bag', 1)
-    new_blanks = list(game_info.get('blanks_on_board', []))
-    for idx in move.get('blanks_used', []):
-        word, row, col = move['word'], move['row'], move['col']
-        horiz = move['direction'] == 'H'
-        r = row if horiz else row + idx
-        c = col + idx if horiz else col
-        if board.is_empty(r, c):
-            new_blanks.append((r, c, word[idx]))
+    """Place candidate, sample N_SAMPLES opponent racks, return avg opp best score.
 
-    placed = board.place_move(move['word'], move['row'], move['col'],
-                              move['direction'] == 'H')
-    opp_scores = []
+    Models opponent as a leave-aware player (score + leave quality), which is
+    more accurate across diverse bot types than pure score-maximization.
+    Records the raw score of the opponent's selected move.
+    """
+    tiles_in_bag = game_info.get('tiles_in_bag', 1)
+    blanks_on_board = game_info.get('blanks_on_board', [])
+    horizontal = move['direction'] == 'H'
+
+    new_blanks = list(blanks_on_board)
+    for bi in move.get('blanks_used', []):
+        if horizontal:
+            new_blanks.append((move['row'], move['col'] + bi, move['word'][bi]))
+        else:
+            new_blanks.append((move['row'] + bi, move['col'], move['word'][bi]))
+
+    placed = board.place_move(move['word'], move['row'], move['col'], horizontal)
+
+    running_sum = 0.0
+    rack_draw = min(7, len(unseen_list))
+
     for _ in range(N_SAMPLES):
-        random.shuffle(unseen_list)
-        opp_rack  = ''.join(unseen_list[:min(7, len(unseen_list))])
+        opp_rack = ''.join(random.sample(unseen_list, rack_draw))
         opp_moves = get_legal_moves(board, opp_rack, new_blanks)
         if opp_moves:
             best = max(opp_moves,
                        key=lambda m: m['score'] + crossplay_leave_value(
                            m.get('leave', ''), tiles_in_bag))
-            opp_scores.append(best['score'])
-        else:
-            opp_scores.append(0)
+            running_sum += best['score']
 
     board.undo_move(placed)
-    return sum(opp_scores) / len(opp_scores) if opp_scores else 0.0
+    return running_sum / N_SAMPLES
 
 
 class MyBot(BaseEngine):
     def pick_move(self, board, rack, moves, game_info):
         if not moves:
             return None
-        tiles_in_bag = game_info.get('tiles_in_bag', 1)
-        if tiles_in_bag == 0:
-            return moves[0]
 
+        tiles_in_bag = game_info.get('tiles_in_bag', 1)
         unseen = unseen_tiles(board, rack, game_info)
 
         candidates = sorted(
@@ -142,6 +159,7 @@ class MyBot(BaseEngine):
             reverse=True
         )[:N_CANDIDATES]
 
+        # No simulation when bag is nearly empty — leave value dominates
         if tiles_in_bag < 15:
             return candidates[0]
 
