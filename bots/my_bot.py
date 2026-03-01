@@ -1,13 +1,13 @@
 """
 MyBot -- Crossplay-calibrated Monte Carlo simulation.
 
-v9: Tier-aware parameters (BOT_TIER env var).
-    Hand-tuned single-tile leave values + score+leave opponent model.
-    Vowel/consonant balance heuristic for multi-tile leaves.
-    Leave decay as bag empties. Q-without-U penalty.
+v10: Duplicate tile penalty added to leave evaluation.
+     Penalizes holding multiple copies of the same tile (SS, ZZ, RR, etc.)
+     since second copies reduce flexibility without proportional value gain.
 """
 import os
 import random
+from collections import Counter
 from bots.base_engine import BaseEngine, get_legal_moves
 from engine.config import TILE_DISTRIBUTION
 
@@ -79,12 +79,29 @@ def crossplay_leave_value(leave, tiles_in_bag=100, unseen=None):
     value = sum(CROSSPLAY_TILE_VALUES.get(t, -1.0) for t in leave)
 
     if len(leave) >= 2:
+        # Vowel/consonant balance heuristic
         vowels = sum(1 for t in leave if t in 'AEIOU')
         consonants = sum(1 for t in leave if t.isalpha() and t not in 'AEIOU' and t != '?')
         if vowels == 1 and consonants >= 1:
             value += 2.0
         elif vowels >= 2 and consonants == 0:
             value -= 5.0
+
+        # Duplicate tile penalty: second copy of any tile reduces flexibility
+        for tile, count in Counter(t.upper() for t in leave).items():
+            if count >= 2:
+                tv = CROSSPLAY_TILE_VALUES.get(tile, -1.0)
+                if tile == '?':
+                    penalty = 8.0   # ?? still great but not worth 2x single blank
+                elif tv >= 5.0:     # S, Z
+                    penalty = 5.0   # SS/ZZ badly overvalued without this
+                elif tv >= 2.0:     # X
+                    penalty = 4.0
+                elif tv >= 0.5:     # R, H, C, M
+                    penalty = 3.0
+                else:               # vowels, low-value consonants
+                    penalty = 1.5
+                value -= penalty * (count - 1)
 
     if 'Q' in leave and unseen is not None and unseen.get('U', 0) == 0:
         value -= 8.0
