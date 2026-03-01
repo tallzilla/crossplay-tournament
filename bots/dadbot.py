@@ -1,6 +1,6 @@
 """
-DadBot v3 -- Parallel Cython-accelerated Monte Carlo 2-ply evaluation
-with positional heuristics, real threat analysis, and performance tiers.
+DadBot v4 -- Parallel Cython-accelerated Monte Carlo 2-ply evaluation
+with risk heuristics and performance tiers.
 
 Uses the crossplay engine's compiled C extension (gaddag_accel.pyd) for
 blazing-fast opponent simulation with multiprocessing parallelism.
@@ -12,23 +12,20 @@ Architecture:
   - Each worker: reconstruct board, place candidate, create BoardContext,
     run K MC sims with early stopping, return avg_opp
   - Main process: aggregate results, add SuperLeaves + positional adj,
-    optionally run blank 3-ply check, real risk reranking, pick best
+    pick best
 
 Evaluation modes:
   - Mid-game (bag > 8): Parallel MC 2-ply + SuperLeaves + positional adj
-    + blocker candidates + blank correction + bingo probability
-    + optional blank 3-ply + real risk reranking (STANDARD/DEEP)
-    + exchange MC pipeline (STANDARD/DEEP)
+    + blank correction + bingo probability + exchange screening
   - Near-endgame (bag 1-8): Hybrid -- exhaustive 3-ply for bag-emptying
     moves, parity-adjusted 1-ply for non-emptying moves
   - Endgame (bag=0): Deterministic minimax (opponent rack known exactly)
-  - Exchange: Quick screening (FAST), full MC pipeline (STANDARD/DEEP)
 
 Performance tiers (BOT_TIER env var):
-  - blitz:    ~1s/move   (N=10, K=300,  SE=1.5, min_sims=30)
-  - fast:     ~3s/move   (N=15, K=600,  SE=1.2, min_sims=50)  [default]
+  - blitz:    ~1s/move   (N=7,  K=150,  SE=1.5, min_sims=20)
+  - fast:     ~3s/move   (N=15, K=400,  SE=1.2, min_sims=50)  [default]
   - standard: ~10s/move  (N=30, K=1500, SE=0.8, min_sims=80)
-  - deep:     ~30s/move  (N=40, K=2500, SE=0.5, min_sims=100)
+  - deep:     ~30s/move  (N=35, K=2000, SE=0.5, min_sims=100)
 
 Falls back to sequential Python if Cython extension is unavailable.
 """
@@ -77,25 +74,15 @@ TIERS = {
         'ES_MIN_SIMS': 20,
         'NEAR_ENDGAME_TIME': 3.0,
         'EXCHANGE_EVAL': False,
-        'BLANK_3PLY': False,
-        'BLANK_3PLY_TIME': 0,
-        'REAL_RISK': False,
-        'BLOCKER_CANDIDATES': 0,
-        'EXCHANGE_MC': False,
         'MC_SKIP_MARGIN': 10.0,
     },
     'fast': {
-        'N_CANDIDATES': 10,
+        'N_CANDIDATES': 15,
         'K_SIMS': 400,
         'ES_SE_THRESHOLD': 1.2,
         'ES_MIN_SIMS': 50,
         'NEAR_ENDGAME_TIME': 5.0,
         'EXCHANGE_EVAL': True,
-        'BLANK_3PLY': False,
-        'BLANK_3PLY_TIME': 0,
-        'REAL_RISK': False,
-        'BLOCKER_CANDIDATES': 3,
-        'EXCHANGE_MC': False,
         'MC_SKIP_MARGIN': 8.0,
     },
     'standard': {
@@ -105,41 +92,28 @@ TIERS = {
         'ES_MIN_SIMS': 80,
         'NEAR_ENDGAME_TIME': 15.0,
         'EXCHANGE_EVAL': True,
-        'BLANK_3PLY': True,
-        'BLANK_3PLY_TIME': 8.0,
-        'REAL_RISK': True,
-        'RISK_TOP_N': 5,
-        'BLOCKER_CANDIDATES': 5,
-        'EXCHANGE_MC': True,
-        'EXCHANGE_MC_TOP': 3,
     },
     'deep': {
-        'N_CANDIDATES': 40,
-        'K_SIMS': 2500,
+        'N_CANDIDATES': 35,
+        'K_SIMS': 2000,
         'ES_SE_THRESHOLD': 0.5,
         'ES_MIN_SIMS': 100,
         'NEAR_ENDGAME_TIME': 15.0,
         'EXCHANGE_EVAL': True,
-        'BLANK_3PLY': True,
-        'BLANK_3PLY_TIME': 25.0,
-        'REAL_RISK': True,
-        'RISK_TOP_N': 8,
-        'BLOCKER_CANDIDATES': 5,
-        'EXCHANGE_MC': True,
-        'EXCHANGE_MC_TOP': 5,
     },
 }
 
 # Fixed MC parameters
 ES_CHECK_EVERY = 10         # Check convergence every N sims
 
-# Dynamic worker count: cpu_threads - 5 (reserve for OS, tournament runner,
-# opponent bot, DadBot main thread, headroom). Override with MC_WORKERS env var.
+# Dynamic worker count: cpu_threads - 3 (reserve for OS + opponent bot + main).
+# 9 workers on 12-thread machine tested ~7% faster than 7 workers with no
+# degradation on opponent throughput. Override with MC_WORKERS env var.
 _mc_workers_env = os.environ.get('MC_WORKERS')
 if _mc_workers_env:
     MC_WORKERS = int(_mc_workers_env)
 else:
-    MC_WORKERS = max(1, os.cpu_count() - 5)  # e.g. 12 threads -> 7 workers
+    MC_WORKERS = max(1, os.cpu_count() - 3)  # e.g. 12 threads -> 9 workers
 
 # Exchange parameters
 EXCHANGE_EQUITY_THRESHOLD = 35.0  # consider exchange if best 1-ply < this
@@ -148,17 +122,10 @@ EXCHANGE_QUICK_MC = 200           # quick MC sims per exchange option
 
 # Positional evaluation constants
 RISK_PENALTIES = {'3W': 8.0, '2W': 3.0, '3L': 1.5, '2L': 0.5}
-BLOCKING_CREDITS = {'3W': 15.0, '2W': 8.0, '3L': 3.0, '2L': 2.0}
-HIGH_VALUE_TILES = {'J', 'Q', 'X', 'Z', 'K'}
-HVT_PREMIUM_SCALE = 0.15
 MC_POSITIONAL_DAMPEN = 0.5
-REAL_RISK_WEIGHT = 0.7    # Dampen real risk since MC partially captures opponent response
-WORD_END_FACTOR = 0.7     # Reduced penalty for word-end access vs perpendicular
 
-# Blank 3-ply constants
-BLANK_3PLY_MIN_BLANKS = 2
-BLANK_3PLY_MIN_BAG = 9
-BLANK_3PLY_K_SIMS = 200
+# Multiplier when a bonus square is attackable from both H and V directions
+DUAL_DIRECTION_MULT = 1.5
 
 # Bag parity penalty table (from crossplay engine)
 _PARITY_P_OPP_EMPTIES = {
@@ -187,7 +154,6 @@ for (_r1, _c1), _btype in BONUS_SQUARES.items():
 
 # Pre-computed bonus square sets (1-indexed)
 DLS_POSITIONS = frozenset((r, c) for (r, c), v in BONUS_SQUARES.items() if v == '2L')
-DWS_POSITIONS = frozenset((r, c) for (r, c), v in BONUS_SQUARES.items() if v == '2W')
 
 # Hookability: how many 2-letter words can each letter form?
 HOOKABILITY = {
@@ -317,18 +283,16 @@ def _formula_leave(leave_str, bag_empty=False):
 # ---------------------------------------------------------------------------
 _gdata_bytes = None
 _word_set = None
-_dictionary = None  # Full dictionary object for real_risk
 
 
 def _ensure_resources():
-    global _gdata_bytes, _word_set, _dictionary
+    global _gdata_bytes, _word_set
     if _gdata_bytes is not None:
         return
     from engine.gaddag import get_gaddag
     _gdata_bytes = bytes(get_gaddag()._data)
     from engine.dictionary import get_dictionary
-    _dictionary = get_dictionary()
-    _word_set = _dictionary._words
+    _word_set = get_dictionary()._words
 
 
 def _get_accel():
@@ -427,10 +391,6 @@ def _was_already_reachable(grid, pr, pc, word_positions):
     return False
 
 
-# Multiplier when a bonus square is attackable from both H and V directions
-DUAL_DIRECTION_MULT = 1.5
-
-
 def _direction_count(grid, br, bc, word_positions):
     """Count how many axes (H, V) a bonus square can be exploited from.
 
@@ -449,29 +409,21 @@ def _direction_count(grid, br, bc, word_positions):
     return (1 if h_ok else 0) + (1 if v_ok else 0) or 1
 
 
-def _compute_risk_and_blocking(grid, move):
-    """Compute risk penalty for opened bonus squares + blocking bonus for covered ones.
+def _compute_risk(grid, move):
+    """Compute risk penalty for newly opened bonus squares.
 
-    Returns (risk_penalty, blocking_bonus) -- both positive values.
+    Scans perpendicular neighbors of each tile in the word for bonus squares
+    that become newly reachable. Returns risk_penalty (positive float).
     """
     word_positions = _get_word_positions(move)
-    new_positions = _get_new_positions(grid, move)
     word = move['word']
     row, col = move['row'], move['col']
     horizontal = move['direction'] == 'H'
     word_len = len(word)
 
     risk_penalty = 0.0
-    blocking_bonus = 0.0
     seen_opened = set()
 
-    # Blocking: credit for covering bonus squares with new tiles
-    for r, c, _ in new_positions:
-        bonus_type = BONUS_SQUARES.get((r, c))
-        if bonus_type:
-            blocking_bonus += BLOCKING_CREDITS.get(bonus_type, 0)
-
-    # Risk: penalty for newly opened bonus squares
     # Perpendicular adjacency for each tile in word
     for i in range(word_len):
         if horizontal:
@@ -495,35 +447,7 @@ def _compute_risk_and_blocking(grid, move):
                 mult = DUAL_DIRECTION_MULT if dirs >= 2 else 1.0
                 risk_penalty += RISK_PENALTIES.get(bonus_type, 0) * mult
 
-    # Word-end squares (extension points) -- reduced penalty
-    if horizontal:
-        ends = []
-        if col > 1:
-            ends.append((row, col - 1))
-        end_col = col + word_len
-        if end_col <= 15:
-            ends.append((row, end_col))
-    else:
-        ends = []
-        if row > 1:
-            ends.append((row - 1, col))
-        end_row = row + word_len
-        if end_row <= 15:
-            ends.append((end_row, col))
-
-    for nr, nc in ends:
-        if (nr, nc) in seen_opened:
-            continue
-        if grid[nr - 1][nc - 1] is not None:
-            continue
-        bonus_type = BONUS_SQUARES.get((nr, nc))
-        if bonus_type and not _was_already_reachable(grid, nr, nc, word_positions):
-            seen_opened.add((nr, nc))
-            dirs = _direction_count(grid, nr, nc, word_positions)
-            mult = DUAL_DIRECTION_MULT if dirs >= 2 else 1.0
-            risk_penalty += RISK_PENALTIES.get(bonus_type, 0) * WORD_END_FACTOR * mult
-
-    return risk_penalty, blocking_bonus
+    return risk_penalty
 
 
 def _compute_dls_exposure(grid, move, unseen_pool=None):
@@ -583,150 +507,11 @@ def _compute_dls_exposure(grid, move, unseen_pool=None):
     return -total_penalty
 
 
-def _compute_double_double(grid, move):
-    """Detect double-double lanes opened/blocked. Returns adjustment."""
-    word = move['word']
-    row, col = move['row'], move['col']
-    horizontal = move['direction'] == 'H'
-
-    positions = _get_word_positions(move)
-    dws_covered = positions & DWS_POSITIONS
-
-    if len(dws_covered) >= 2:
-        return 5.0  # We're getting a double-double
-
-    dd_risk = 0.0
-    for i in range(len(word)):
-        if horizontal:
-            r, c = row, col + i
-        else:
-            r, c = row + i, col
-
-        if grid[r - 1][c - 1] is not None:
-            continue
-
-        if horizontal:
-            for dr in range(-1, -8, -1):
-                nr = r + dr
-                if 1 <= nr <= 15 and (nr, c) in DWS_POSITIONS:
-                    dd_risk += 1.0
-                    break
-            for dr in range(1, 8):
-                nr = r + dr
-                if 1 <= nr <= 15 and (nr, c) in DWS_POSITIONS:
-                    dd_risk += 1.0
-                    break
-        else:
-            for dc in range(-1, -8, -1):
-                nc = c + dc
-                if 1 <= nc <= 15 and (r, nc) in DWS_POSITIONS:
-                    dd_risk += 1.0
-                    break
-            for dc in range(1, 8):
-                nc = c + dc
-                if 1 <= nc <= 15 and (r, nc) in DWS_POSITIONS:
-                    dd_risk += 1.0
-                    break
-
-    return -dd_risk * 0.5 if dd_risk > 0 else 0.0
-
-
-def _compute_tile_turnover(move, bag_size):
-    """Bonus for using more tiles (drawing more = better chance at blanks/S)."""
-    if bag_size <= 7:
-        return 0.0
-    tiles_used = move.get('tiles_used', list(move['word']))
-    n_used = len(tiles_used)
-    base = max(0, (n_used - 2)) * 0.3
-    bag_factor = min(1.0, bag_size / 80.0)
-    return min(2.0, base * bag_factor)
-
-
-CROSSWORD_BONUS_MULT = 1.8  # Premium multiplier when tile also forms a crossword
-
-
-def _has_crossword(grid, r, c, horizontal):
-    """Check if placing a tile at (r,c) forms a perpendicular word."""
-    if horizontal:
-        has_above = (r > 1 and grid[r - 2][c - 1] is not None)
-        has_below = (r < 15 and grid[r][c - 1] is not None)
-        return has_above or has_below
-    else:
-        has_left = (c > 1 and grid[r - 1][c - 2] is not None)
-        has_right = (c < 15 and grid[r - 1][c] is not None)
-        return has_left or has_right
-
-
-def _compute_hvt_premium(grid, move):
-    """Bonus for placing high-value tiles on premium squares.
-
-    When a tile also forms a perpendicular crossword, the premium square
-    bonus applies to both words -- apply CROSSWORD_BONUS_MULT to reflect
-    the additional scoring from the crossword direction.
-    """
-    word = move['word']
-    row, col = move['row'], move['col']
-    horizontal = move['direction'] == 'H'
-    blanks_used = set(move.get('blanks_used', []))
-
-    new_positions = []
-    for i, letter in enumerate(word):
-        r = row + (0 if horizontal else i)
-        c = col + (i if horizontal else 0)
-        if 1 <= r <= 15 and 1 <= c <= 15 and grid[r - 1][c - 1] is None:
-            new_positions.append((i, r, c, letter))
-
-    hvt_values = []
-    for wi, r, c, letter in new_positions:
-        if wi not in blanks_used and letter in HIGH_VALUE_TILES:
-            hvt_values.append(TILE_VALUES.get(letter, 0))
-
-    if not hvt_values:
-        return 0.0
-
-    sum_hvt = sum(hvt_values)
-    total_bonus = 0.0
-
-    for wi, r, c, letter in new_positions:
-        bonus_type = BONUS_SQUARES.get((r, c))
-        if not bonus_type:
-            continue
-        cross = _has_crossword(grid, r, c, horizontal)
-        cmult = CROSSWORD_BONUS_MULT if cross else 1.0
-
-        if bonus_type == '3L':
-            if wi not in blanks_used and letter in HIGH_VALUE_TILES:
-                total_bonus += TILE_VALUES.get(letter, 0) * 2 * HVT_PREMIUM_SCALE * cmult
-        elif bonus_type == '2L':
-            if wi not in blanks_used and letter in HIGH_VALUE_TILES:
-                total_bonus += TILE_VALUES.get(letter, 0) * 1 * HVT_PREMIUM_SCALE * cmult
-        elif bonus_type == '3W':
-            total_bonus += sum_hvt * 2 * HVT_PREMIUM_SCALE * cmult
-        elif bonus_type == '2W':
-            total_bonus += sum_hvt * 1 * HVT_PREMIUM_SCALE * cmult
-
-    return total_bonus
-
-
-def _compute_positional_adj(grid, move, unseen_pool, bag_size, real_risk_mode=False):
-    """Combined positional adjustment for a candidate move.
-
-    When real_risk_mode is True (standard/deep tiers), skip the heuristic
-    risk/dls/dd penalties -- real_risk.calculate_real_risk() handles those
-    with actual word-based threat enumeration in the post-MC reranking step.
-    """
-    if real_risk_mode:
-        _, blocking = _compute_risk_and_blocking(grid, move)
-        turnover = _compute_tile_turnover(move, bag_size)
-        hvt = _compute_hvt_premium(grid, move)
-        return blocking + turnover + hvt
-    else:
-        risk, blocking = _compute_risk_and_blocking(grid, move)
-        dls = _compute_dls_exposure(grid, move, unseen_pool)
-        dd = _compute_double_double(grid, move)
-        turnover = _compute_tile_turnover(move, bag_size)
-        hvt = _compute_hvt_premium(grid, move)
-        return blocking - risk + dls + dd + turnover + hvt
+def _compute_positional_adj(grid, move, unseen_pool, bag_size):
+    """Positional adjustment: risk penalty + DLS exposure."""
+    risk = _compute_risk(grid, move)
+    dls = _compute_dls_exposure(grid, move, unseen_pool)
+    return -risk + dls
 
 
 # ===================================================================
@@ -867,112 +652,6 @@ def _worker_eval_candidate(args):
         'n_sims': n_sims,
         'sum': running_sum,
         'sum_sq': running_sum_sq,
-    }
-
-
-def _worker_eval_exchange(args):
-    """Worker: MC evaluation for exchange candidate.
-
-    Board stays unchanged (exchange places no tiles). For each sim:
-    1. Sample opponent rack from unseen pool
-    2. Find opponent's best move on unchanged board
-    3. Simulate post-exchange draw (dump goes back to bag, draw replacements)
-    4. Evaluate new rack leave
-
-    Args tuple: (grid, bb_set_list, exch_info, unseen_pool, k_sims, seed,
-                  es_min_sims, es_check_every, es_se_threshold)
-    """
-    (grid, bb_set_list, exch_info, unseen_pool, k_sims, seed,
-     es_min_sims, es_check_every, es_se_threshold) = args
-
-    random.seed(seed)
-
-    from engine.config import VALID_TWO_LETTER, BINGO_BONUS, RACK_SIZE
-    from engine.board import Board
-
-    bb_set = set(bb_set_list)
-
-    board = Board()
-    for r in range(15):
-        for c in range(15):
-            if grid[r][c] is not None:
-                board._grid[r][c] = grid[r][c]
-
-    keep_tiles = list(exch_info['keep'])
-    dump_tiles = list(exch_info['dump'])
-    draw_n = len(dump_tiles)  # Draw as many as we dump
-
-    use_cython = (_w_accel is not None and
-                  hasattr(_w_accel, 'prepare_board_context') and
-                  _w_gdata_bytes is not None)
-
-    ctx = None
-    if use_cython:
-        ctx = _w_accel.prepare_board_context(
-            board._grid, _w_gdata_bytes, bb_set,
-            _w_word_set, VALID_TWO_LETTER,
-            _w_tv, _w_bonus, BINGO_BONUS, RACK_SIZE,
-        )
-
-    pool_size = len(unseen_pool)
-    rack_draw = min(RACK_SIZE, pool_size)
-
-    running_opp_sum = 0.0
-    running_leave_sum = 0.0
-    n_sims = 0
-
-    for sim_i in range(k_sims):
-        if n_sims >= es_min_sims and n_sims % es_check_every == 0 and n_sims > 0:
-            # Early stop based on total equity variance (opp + leave combined)
-            avg_so_far = (running_leave_sum - running_opp_sum) / n_sims
-            # Simple check: if we have enough sims, break
-            if n_sims >= es_min_sims * 2:
-                break
-
-        # Sample opponent rack
-        opp_rack = ''.join(random.sample(unseen_pool, rack_draw))
-
-        # Opponent's best move on unchanged board
-        if use_cython:
-            opp_score, _, _, _, _ = _w_accel.find_best_score_c(ctx, opp_rack)
-        else:
-            blanks_1idx = [(r + 1, c + 1, '') for r, c in bb_set]
-            opp_moves = get_legal_moves(board, opp_rack, blanks_1idx)
-            opp_score = opp_moves[0]['score'] if opp_moves else 0
-
-        # Simulate post-exchange draw
-        # Pool = unseen - opp_rack + dump_tiles (dumped go back to bag)
-        remaining = list(unseen_pool)
-        opp_rack_list = list(opp_rack)
-        for t in opp_rack_list:
-            try:
-                remaining.remove(t)
-            except ValueError:
-                pass
-        remaining.extend(dump_tiles)
-
-        if len(remaining) >= draw_n and draw_n > 0:
-            drawn = random.sample(remaining, draw_n)
-            new_rack = keep_tiles + drawn
-        else:
-            new_rack = keep_tiles + remaining[:draw_n]
-
-        new_leave_val = _leave_value(''.join(new_rack))
-
-        running_opp_sum += opp_score
-        running_leave_sum += new_leave_val
-        n_sims += 1
-
-    avg_opp = running_opp_sum / n_sims if n_sims > 0 else 0.0
-    avg_new_leave = running_leave_sum / n_sims if n_sims > 0 else 0.0
-
-    return {
-        'is_exchange': True,
-        'keep': exch_info['keep'],
-        'dump': exch_info['dump'],
-        'avg_opp': avg_opp,
-        'avg_new_leave': avg_new_leave,
-        'n_sims': n_sims,
     }
 
 
@@ -1177,177 +856,6 @@ def _worker_eval_near_endgame(args):
 
 
 # ===================================================================
-# Blank 3-ply worker (STANDARD/DEEP only)
-# ===================================================================
-
-def _worker_eval_3ply_blank(args):
-    """Worker: 3-ply MC evaluation for blank strategy.
-
-    Ply 1: place our move
-    Ply 2: opponent's best response
-    Ply 3: our follow-up move after drawing new tiles
-
-    Args tuple: (grid, bb_set_list, move, unseen_pool, your_rack,
-                  k_sims, seed, bag_size)
-    """
-    (grid, bb_set_list, move, unseen_pool, your_rack,
-     k_sims, seed, bag_size) = args
-
-    random.seed(seed)
-
-    from engine.config import VALID_TWO_LETTER, BINGO_BONUS, RACK_SIZE
-    from engine.board import Board
-
-    bb_set = set(bb_set_list)
-
-    board = Board()
-    for r in range(15):
-        for c in range(15):
-            if grid[r][c] is not None:
-                board._grid[r][c] = grid[r][c]
-
-    # Place our move (ply 1)
-    horizontal = move['direction'] == 'H'
-    placed_1 = board.place_move(move['word'], move['row'], move['col'], horizontal)
-
-    # Update blank set
-    move_bb = set(bb_set)
-    for bi in move.get('blanks_used', []):
-        if horizontal:
-            move_bb.add((move['row'] - 1, move['col'] - 1 + bi))
-        else:
-            move_bb.add((move['row'] - 1 + bi, move['col'] - 1))
-
-    # Compute leave
-    tiles_used = move.get('tiles_used', list(move['word']))
-    rack_list = list(your_rack.upper())
-    for t in tiles_used:
-        if t in rack_list:
-            rack_list.remove(t)
-        elif '?' in rack_list:
-            rack_list.remove('?')
-    leave = ''.join(rack_list)
-    tiles_used_count = len(tiles_used)
-
-    # Setup Cython
-    use_cython = (_w_accel is not None and
-                  hasattr(_w_accel, 'prepare_board_context') and
-                  _w_gdata_bytes is not None)
-
-    if use_cython:
-        ctx_ply2 = _w_accel.prepare_board_context(
-            board._grid, _w_gdata_bytes, move_bb,
-            _w_word_set, VALID_TWO_LETTER,
-            _w_tv, _w_bonus, BINGO_BONUS, RACK_SIZE,
-        )
-
-    pool_size = len(unseen_pool)
-    rack_draw = min(RACK_SIZE, pool_size)
-
-    running_sum = 0.0
-    running_sum_sq = 0.0
-    n_sims = 0
-
-    for sim_i in range(k_sims):
-        # Early stopping (SE < 2.0 -- higher threshold for 3-ply variance)
-        if n_sims >= 30 and n_sims % 10 == 0:
-            variance = (running_sum_sq / n_sims) - (running_sum / n_sims) ** 2
-            if variance > 0 and (variance / n_sims) ** 0.5 < 2.0:
-                break
-
-        # Sample opponent rack (ply 2)
-        opp_rack_list = random.sample(unseen_pool, rack_draw)
-        opp_rack = ''.join(opp_rack_list)
-
-        # Ply 2: opponent's best response
-        opp_score = 0
-        opp_word = None
-        opp_r = opp_c = 0
-        opp_d = 'H'
-        if use_cython:
-            opp_score, opp_word, opp_r, opp_c, opp_d = _w_accel.find_best_score_c(
-                ctx_ply2, opp_rack)
-        else:
-            blanks_1idx = [(r + 1, c + 1, '') for r, c in move_bb]
-            opp_moves = get_legal_moves(board, opp_rack, blanks_1idx)
-            if opp_moves:
-                opp_score = opp_moves[0]['score']
-                opp_word = opp_moves[0]['word']
-                opp_r = opp_moves[0]['row']
-                opp_c = opp_moves[0]['col']
-                opp_d = opp_moves[0]['direction']
-
-        # Place opponent's move
-        placed_2 = None
-        if opp_score > 0 and opp_word:
-            opp_horiz = opp_d == 'H' if isinstance(opp_d, str) else opp_d
-            try:
-                placed_2 = board.place_move(opp_word, opp_r, opp_c, opp_horiz)
-            except Exception:
-                placed_2 = None
-
-        # Simulate draw for ply 3
-        bag_tiles = list(unseen_pool)
-        for t in opp_rack_list:
-            if t in bag_tiles:
-                bag_tiles.remove(t)
-
-        draw_count = min(tiles_used_count, len(bag_tiles))
-        drawn = random.sample(bag_tiles, draw_count) if draw_count > 0 else []
-        ply3_rack = leave + ''.join(drawn)
-
-        # Ply 3: our follow-up
-        followup_score = 0
-        if ply3_rack:
-            if placed_2 is not None:
-                if use_cython:
-                    ctx_ply3 = _w_accel.prepare_board_context(
-                        board._grid, _w_gdata_bytes, move_bb,
-                        _w_word_set, VALID_TWO_LETTER,
-                        _w_tv, _w_bonus, BINGO_BONUS, RACK_SIZE,
-                    )
-                    followup_score, _, _, _, _ = _w_accel.find_best_score_c(
-                        ctx_ply3, ply3_rack)
-                else:
-                    blanks_1idx = [(r + 1, c + 1, '') for r, c in move_bb]
-                    resp_moves = get_legal_moves(board, ply3_rack, blanks_1idx)
-                    if resp_moves:
-                        followup_score = resp_moves[0]['score']
-            else:
-                # Opponent passed -- use ply2 board state
-                if use_cython:
-                    followup_score, _, _, _, _ = _w_accel.find_best_score_c(
-                        ctx_ply2, ply3_rack)
-                else:
-                    blanks_1idx = [(r + 1, c + 1, '') for r, c in move_bb]
-                    resp_moves = get_legal_moves(board, ply3_rack, blanks_1idx)
-                    if resp_moves:
-                        followup_score = resp_moves[0]['score']
-
-        # Undo opponent's move
-        if placed_2 is not None:
-            board.undo_move(placed_2)
-
-        net = move['score'] - opp_score + followup_score
-        running_sum += net
-        running_sum_sq += net * net
-        n_sims += 1
-
-    # Undo our move
-    board.undo_move(placed_1)
-
-    avg_3ply = running_sum / n_sims if n_sims > 0 else float(move['score'])
-    return {
-        'word': move['word'],
-        'row': move['row'],
-        'col': move['col'],
-        'direction': move['direction'],
-        'avg_3ply_equity': avg_3ply,
-        'n_sims': n_sims,
-    }
-
-
-# ===================================================================
 # Near-endgame hybrid evaluator (bag 1-8)
 # ===================================================================
 
@@ -1491,24 +999,6 @@ def _blank_correction_factor(total_unseen, blanks_unseen):
 
 
 # ===================================================================
-# Blocker candidate selection
-# ===================================================================
-
-def _blocks_premium(move, grid):
-    """Check if a move covers a premium square (3W, 2W, or 3L)."""
-    row, col = move['row'], move['col']
-    horizontal = move['direction'] == 'H'
-    for i in range(len(move['word'])):
-        r = row + (0 if horizontal else i)
-        c = col + (i if horizontal else 0)
-        if 1 <= r <= 15 and 1 <= c <= 15 and grid[r - 1][c - 1] is None:
-            bonus = BONUS_SQUARES.get((r, c))
-            if bonus in ('3W', '2W', '3L'):
-                return True
-    return False
-
-
-# ===================================================================
 # Exchange evaluation
 # ===================================================================
 
@@ -1576,7 +1066,7 @@ def _get_pool():
     global _pool
     if _pool is None:
         print(f"  [DadBot] MC pool: {MC_WORKERS} workers "
-              f"({os.cpu_count()} threads - 5 reserved)")
+              f"({os.cpu_count()} threads - 3 reserved)")
         _pool = ProcessPoolExecutor(
             max_workers=MC_WORKERS,
             initializer=_worker_init,
@@ -1606,6 +1096,7 @@ class DadBot(BaseEngine):
             return None
 
         _ensure_resources()
+        _DIAG = os.environ.get('DADBOT_TIMING', '')
 
         bag_tiles = game_info.get('tiles_in_bag', 1)
         blanks_on_board = game_info.get('blanks_on_board', [])
@@ -1630,33 +1121,23 @@ class DadBot(BaseEngine):
         # ---------------------------------------------------------------
         # Mid-game: parallel MC 2-ply with SuperLeaves + positional adj
         # ---------------------------------------------------------------
+        t_move_start = time.perf_counter()
         unseen_pool = _compute_unseen(grid, rack, blanks_on_board)
 
         # Rank candidates by 1-ply equity (score + leave)
+        t0 = time.perf_counter()
         ranked = _rank_by_equity(moves, bag_tiles)
         n_cands = cfg['N_CANDIDATES']
         candidates = [(m, lv) for m, eq, lv in ranked[:n_cands]]
-
-        # Add blocker candidates (moves covering premium squares)
-        max_blockers = cfg.get('BLOCKER_CANDIDATES', 0)
-        if max_blockers > 0:
-            cand_ids = {id(m) for m, _ in candidates}
-            blockers_added = 0
-            for m, eq, lv in ranked[n_cands:]:
-                if blockers_added >= max_blockers:
-                    break
-                if id(m) not in cand_ids and _blocks_premium(m, grid):
-                    candidates.append((m, lv))
-                    cand_ids.add(id(m))
-                    blockers_added += 1
+        t_rank = time.perf_counter() - t0
 
         # Compute positional adjustment for each candidate (main process, <25ms)
-        use_real_risk = cfg.get('REAL_RISK', False)
+        t0 = time.perf_counter()
         pos_adjs = []
         for move, lv in candidates:
-            pos_adj = _compute_positional_adj(grid, move, unseen_pool, bag_tiles,
-                                              real_risk_mode=use_real_risk)
+            pos_adj = _compute_positional_adj(grid, move, unseen_pool, bag_tiles)
             pos_adjs.append(pos_adj)
+        t_posadj = time.perf_counter() - t0
 
         # MC skip: if top 1-ply candidate leads by a wide margin, skip MC
         mc_skip_margin = cfg.get('MC_SKIP_MARGIN', 0)
@@ -1668,12 +1149,16 @@ class DadBot(BaseEngine):
                 return candidates[0][0]
 
         # Check if exchange should be considered
+        t0 = time.perf_counter()
         best_1ply_equity = ranked[0][1] if ranked else 0
         exch_opts = None
+        n_exch_combos = 0
         if (cfg.get('EXCHANGE_EVAL', True)
                 and best_1ply_equity < EXCHANGE_EQUITY_THRESHOLD
                 and bag_tiles >= RACK_SIZE):
             exch_opts = _generate_exchange_candidates(rack, unseen_pool)
+            n_exch_combos = len(exch_opts) if exch_opts else 0
+        t_exch = time.perf_counter() - t0
 
         # Build work items for MC (with tier-specific ES params)
         bb_set_list = [(r - 1, c - 1) for r, c, _ in (blanks_on_board or [])]
@@ -1696,20 +1181,10 @@ class DadBot(BaseEngine):
             work.append((grid, bb_set_list, move_data, unseen_pool,
                          k_sims, seed, es_min, ES_CHECK_EVERY, es_se))
 
-        # Build exchange MC work items (standard/deep only)
-        exch_work = []
-        use_exchange_mc = cfg.get('EXCHANGE_MC', False)
-        if use_exchange_mc and exch_opts:
-            exch_top = cfg.get('EXCHANGE_MC_TOP', 3)
-            for exch in exch_opts[:exch_top]:
-                seed = random.randint(0, 2**31)
-                exch_work.append((grid, bb_set_list, exch, unseen_pool,
-                                  k_sims, seed, es_min, ES_CHECK_EVERY, es_se))
-
         # Fan out to worker pool
+        t0 = time.perf_counter()
         pool = _get_pool()
         futures = [pool.submit(_worker_eval_candidate, w) for w in work]
-        exch_futures = [pool.submit(_worker_eval_exchange, w) for w in exch_work]
 
         # Compute blank correction factor
         blanks_in_unseen = sum(1 for t in unseen_pool if t == '?')
@@ -1719,11 +1194,12 @@ class DadBot(BaseEngine):
         best_move = None
         best_total = float('-inf')
         bag_empty_flag = bag_tiles <= RACK_SIZE
-        candidates_with_results = []
+        total_sims = 0
 
         for i, future in enumerate(futures):
             result = future.result(timeout=60)
             avg_opp = result['avg_opp'] * blank_corr  # Apply blank correction
+            total_sims += result.get('n_sims', 0)
             move, leave_val = candidates[i]
             mc_equity = move['score'] - avg_opp
 
@@ -1733,63 +1209,29 @@ class DadBot(BaseEngine):
             # Combine: MC equity + leave + damped positional adjustment
             total = mc_equity + lv + pos_adjs[i] * MC_POSITIONAL_DAMPEN
 
-            candidates_with_results.append((move, total))
-
             if total > best_total:
                 best_total = total
                 best_move = move
 
-        # Collect exchange MC results and compete with regular moves
-        best_exch_total = float('-inf')
-        best_exch_result = None
-        if exch_futures:
-            for future in exch_futures:
-                result = future.result(timeout=60)
-                avg_opp = result['avg_opp'] * blank_corr
-                avg_new_leave = result['avg_new_leave']
-                # Exchange equity: score 0, lose opp's response, gain new rack
-                exch_total = (0 - avg_opp) + avg_new_leave
-                if exch_total > best_exch_total:
-                    best_exch_total = exch_total
-                    best_exch_result = result
+        t_mc = time.perf_counter() - t0
+        t_total = time.perf_counter() - t_move_start
 
-            # Exchange wins if it beats best regular move on total equity
-            if best_exch_result is not None and best_exch_total > best_total:
-                return None  # Signal exchange (pass/exchange)
+        # Timing diagnostics
+        if _DIAG:
+            sims_per_sec = total_sims / t_mc if t_mc > 0 else 0
+            print(f"  [TIMING] rank={t_rank*1000:.0f}ms "
+                  f"posadj={t_posadj*1000:.0f}ms "
+                  f"exch={t_exch*1000:.0f}ms({n_exch_combos}opts) "
+                  f"MC={t_mc*1000:.0f}ms({total_sims}sims,{sims_per_sec:.0f}/s) "
+                  f"total={t_total*1000:.0f}ms "
+                  f"bag={bag_tiles} cands={len(candidates)} "
+                  f"moves={len(moves)}")
 
-        elif exch_opts and not use_exchange_mc:
-            # Non-MC exchange path (blitz/fast): crude threshold
-            if exch_opts[0]['expected_leave'] > best_1ply_equity and best_total < 0:
+        # Simple exchange threshold check (non-MC path)
+        if exch_opts:
+            exch_leave = exch_opts[0]['expected_leave']
+            if exch_leave > best_1ply_equity and best_total < 0:
                 return None
-
-        # Optional blank 3-ply check (STANDARD/DEEP tiers)
-        if cfg.get('BLANK_3PLY', False):
-            best_move, best_total = self._blank_3ply_check(
-                board, rack, candidates_with_results,
-                unseen_pool, blanks_on_board, grid, bag_tiles,
-                best_move, best_total)
-
-        # Post-MC real risk reranking (STANDARD/DEEP tiers)
-        if use_real_risk and len(candidates_with_results) > 1:
-            from engine.real_risk import calculate_real_risk
-            unseen_counter = Counter(unseen_pool)
-            top_n = cfg.get('RISK_TOP_N', 5)
-            top_cands = sorted(candidates_with_results,
-                               key=lambda x: -x[1])[:top_n]
-
-            rr_best_move = None
-            rr_best_total = float('-inf')
-            for move, mc_total in top_cands:
-                _, exp_dmg, _, _ = calculate_real_risk(
-                    board, move, unseen_counter, _dictionary,
-                    BONUS_SQUARES, TILE_VALUES)
-                adjusted = mc_total - exp_dmg * REAL_RISK_WEIGHT
-                if adjusted > rr_best_total:
-                    rr_best_total = adjusted
-                    rr_best_move = move
-
-            if rr_best_move is not None:
-                best_move = rr_best_move
 
         return best_move
 
@@ -1859,89 +1301,3 @@ class DadBot(BaseEngine):
             best_move = moves[0]
 
         return best_move
-
-    def _blank_3ply_check(self, board, rack, candidates_with_results,
-                          unseen_pool, blanks_on_board, grid, bag_size,
-                          best_move, best_total):
-        """Check if saving a blank is better via 3-ply evaluation.
-
-        Compares the MC winner (which may spend 2 blanks) against
-        top blank-saving alternatives via 3-ply MC.
-        """
-        blanks_in_rack = rack.count('?')
-        if blanks_in_rack < BLANK_3PLY_MIN_BLANKS:
-            return best_move, best_total
-        if bag_size <= BLANK_3PLY_MIN_BAG:
-            return best_move, best_total
-
-        time_budget = self.config.get('BLANK_3PLY_TIME', 8.0)
-
-        # Identify blank savers vs spenders
-        savers = []
-        for move, mc_total in candidates_with_results:
-            blanks_used_count = len(move.get('blanks_used', []))
-            if blanks_used_count < blanks_in_rack:
-                savers.append((move, mc_total))
-
-        if not savers:
-            return best_move, best_total
-
-        # Build evaluation set: MC winner + top savers + top spenders
-        eval_candidates = [best_move]
-        seen = {(best_move['word'], best_move['row'], best_move['col'])}
-
-        for move, _ in sorted(savers, key=lambda x: -x[1])[:4]:
-            key = (move['word'], move['row'], move['col'])
-            if key not in seen:
-                eval_candidates.append(move)
-                seen.add(key)
-
-        # Add top spenders too for comparison
-        spenders = [(m, t) for m, t in candidates_with_results
-                    if len(m.get('blanks_used', [])) >= blanks_in_rack]
-        for move, _ in sorted(spenders, key=lambda x: -x[1])[:3]:
-            key = (move['word'], move['row'], move['col'])
-            if key not in seen:
-                eval_candidates.append(move)
-                seen.add(key)
-
-        bb_set_list = [(r - 1, c - 1) for r, c, _ in (blanks_on_board or [])]
-
-        work = []
-        for move in eval_candidates:
-            move_data = {
-                'word': move['word'],
-                'row': move['row'],
-                'col': move['col'],
-                'direction': move['direction'],
-                'score': move['score'],
-                'blanks_used': move.get('blanks_used', []),
-                'tiles_used': move.get('tiles_used', list(move['word'])),
-            }
-            seed = random.randint(0, 2**31)
-            work.append((grid, bb_set_list, move_data, unseen_pool, rack,
-                         BLANK_3PLY_K_SIMS, seed, bag_size))
-
-        pool = _get_pool()
-        futures = [pool.submit(_worker_eval_3ply_blank, w) for w in work]
-
-        t_start = time.perf_counter()
-        best_3ply = None
-        best_3ply_eq = float('-inf')
-
-        for i, future in enumerate(futures):
-            remaining = time_budget - (time.perf_counter() - t_start)
-            if remaining <= 0:
-                break
-            try:
-                result = future.result(timeout=max(1, remaining))
-                if result['avg_3ply_equity'] > best_3ply_eq:
-                    best_3ply_eq = result['avg_3ply_equity']
-                    best_3ply = eval_candidates[i]
-            except Exception:
-                continue
-
-        if best_3ply is not None and best_3ply_eq > best_total + 2.0:
-            return best_3ply, best_3ply_eq
-
-        return best_move, best_total

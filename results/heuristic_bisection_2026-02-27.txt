@@ -1,0 +1,59 @@
+=== HEURISTIC BISECTION TEST ===
+Date: 2026-02-27
+Seeds: 743081093, 725414342, 1915759923
+Base config: standard tier N=30, K=1500, ES_SE=0.8, ES_MIN=80
+             REAL_RISK=False, EXCHANGE_MC=False, BLOCKER_CANDIDATES=0
+             BLANK_3PLY=True, EXCHANGE_EVAL=True, POSITIONAL_ADJ=True
+
+All tests use identical tile draws (same seeds). Differences are purely from code.
+
+=== FEATURE-LEVEL BISECTION ===
+
+| Config                           | W-L | Spread  | Delta from baseline |
+|----------------------------------|-----|---------|---------------------|
+| Baseline (current standard)      | 3-0 | +107.3  | --                  |
+| - All positional heuristics      | 2-1 | +41.3   | -66.0               |
+| - Exchange screening             | 3-0 | +77.3   | -30.0               |
+| + BLANK_3PLY (from earlier test) | 3-0 | +107.3  | 0 (neutral)         |
+
+=== INDIVIDUAL HEURISTIC BISECTION ===
+
+| Heuristic disabled | W-L | Spread  | Delta | Lines |
+|--------------------|-----|---------|-------|-------|
+| - risk penalty     | 3-0 | +67.3   | -40.0 | ~40   |
+| - blocking credit  | 3-0 | +105.3  | -2.0  | ~35   |
+| - DLS exposure     | 2-1 | +57.7   | -49.6 | ~55   |
+| - double-double    | 3-0 | +107.3  | 0     | ~45   |
+| - tile turnover    | 3-0 | +107.3  | 0     | ~10   |
+| - HVT premium      | 3-0 | +107.3  | 0     | ~50   |
+
+Note: risk + DLS = -89.6 combined, vs -66 for all heuristics disabled.
+This suggests nonlinear interaction (risk and DLS partially redundant,
+or neutral heuristics add helpful noise that partially compensates).
+
+=== CONCLUSIONS ===
+
+High value (keep):
+  - Risk penalty (-40 pts when removed): Core defensive heuristic. ~40 lines.
+  - DLS exposure (-49.6 pts when removed): HVT exploitation awareness. ~55 lines.
+
+No value (candidates for removal):
+  - Blocking credit (-2 pts): Negligible. ~35 lines.
+  - Double-double (0 pts): Never triggered or value already captured by MC. ~45 lines.
+  - Tile turnover (0 pts): MC naturally rewards using more tiles. ~10 lines.
+  - HVT premium (0 pts): MC already finds HVT placements. ~50 lines.
+
+Exchange screening (-30 pts when removed): Valuable. 52+8 lines for generation+gate.
+  Considered in ~58% of mid-game moves but always rejected in these 3 test games.
+  Value likely comes from the evaluation cost itself -- computing exchange equity
+  as a baseline helps the bot NOT exchange when it shouldn't.
+
+=== REMOVABLE CODE ===
+
+If we prune the 3 disabled features (REAL_RISK, EXCHANGE_MC, BLOCKER_CANDIDATES)
+AND the 4 zero-value heuristics (blocking, double-double, turnover, HVT):
+
+  Disabled features: ~215 lines
+  Zero-value heuristics: ~140 lines
+  Total removable: ~355 lines (18% of DadBot's 1986 lines)
+  DadBot after pruning: ~1,630 lines

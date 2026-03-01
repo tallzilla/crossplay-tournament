@@ -16,5 +16,8 @@ engine/data/crossplay_dict_enhanced.pkl
 .DS_Store
 Thumbs.db
 
+# Old bot versions (kept locally for A/B testing)
+bots/dadbot_v3.py
+
 # Claude Code
 .claude/
