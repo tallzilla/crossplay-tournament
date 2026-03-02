@@ -40,10 +40,10 @@ if _tier == 'blitz':
     K_SIMS       = 60    # ~60ms Cython; target <0.5s/move
 elif _tier == 'standard':
     N_CANDIDATES = 12
-    K_SIMS       = 500   # ~500ms Cython; target ~7s/move
+    K_SIMS       = 300   # target ~7s/move
 elif _tier == 'deep':
     N_CANDIDATES = 15
-    K_SIMS       = 1000  # ~1s Cython; target ~15s/move
+    K_SIMS       = 700   # target ~18s/move
 else:  # fast (default)
     N_CANDIDATES = 8
     K_SIMS       = 120   # ~120ms Cython; target ~2.5s/move
