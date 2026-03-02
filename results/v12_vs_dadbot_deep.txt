@@ -1,0 +1,28 @@
+
+MyBot vs DadBot (10 games)
+Building GADDAG (first run takes ~48s, then cached)...
+  [DadBot] MC pool: 29 workers (32 threads - 3 reserved)
+  [1/10] 0-1 (0 ties) spread: -40 (0.0 games/s)
+  [2/10] 0-2 (0 ties) spread: -41 (0.0 games/s)
+  [3/10] 0-3 (0 ties) spread: -67 (0.0 games/s)
+  [4/10] 0-4 (0 ties) spread: -65 (0.0 games/s)
+  [5/10] 1-4 (0 ties) spread: -23 (0.0 games/s)
+  [6/10] 1-5 (0 ties) spread: -19 (0.0 games/s)
+  [7/10] 2-5 (0 ties) spread: +11 (0.0 games/s)
+  [8/10] 2-6 (0 ties) spread: -6 (0.0 games/s)
+  [9/10] 2-7 (0 ties) spread: -8 (0.0 games/s)
+  [10/10] 3-7 (0 ties) spread: +0 (0.0 games/s)
+
+============================================================
+  Results: MyBot vs DadBot (10 games)
+============================================================
+  MyBot wins:    3  |  DadBot wins:    7  |  Ties: 0
+  Avg spread:    +0.4
+  MyBot avg:  381.6  |  DadBot avg:  381.2
+  Time: 4368.5s (0.0 games/s)
+============================================================
+
+  Speed Report (tier: deep):
+    MyBot: avg 25.42s, p95 67.00s, max 93.07s (139 moves) [OK]
+    DadBot: avg 5.95s, p95 15.09s, max 28.82s (140 moves) [OK]
+
